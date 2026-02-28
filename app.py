@@ -78,13 +78,22 @@ class MultiAgentState(TypedDict):
     final_report: str
     query: str
 
-# ===== 検索担当エージェント =====
+# ===== 検索担当エージェント（キャッシュ対応版） =====
 class SearchAgent:
     def __init__(self, llm):
         self.llm = llm
+        self.search_cache = {}  # 検索結果のキャッシュ
     
     def generate_search_queries(self, query: str) -> List[str]:
-        """質問から複数の検索クエリを生成"""
+        """質問から複数の検索クエリを生成（キャッシュ対応）"""
+        # キャッシュを確認
+        cache_key = query.lower().strip()
+        
+        if cache_key in self.search_cache:
+            print(f"キャッシュヒット: {cache_key}")
+            return self.search_cache[cache_key]
+        
+        # 新規クエリ生成
         prompt = f"""
         以下の質問に答えるための検索クエリを3つ生成してください。
         それぞれ異なる角度からアプローチしてください。
@@ -99,27 +108,71 @@ class SearchAgent:
         
         try:
             response = self.llm.invoke([HumanMessage(content=prompt)])
-            # JSONをパース
             json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
-                return data.get("queries", [query])
+                queries = data.get("queries", [query])
+                
+                # キャッシュに保存
+                self.search_cache[cache_key] = queries
+                
+                return queries
             else:
                 return [query]
         except:
             return [query]
     
+    def get_cached_results(self, query: str) -> List[Dict[str, Any]]:
+        """キャッシュから検索結果を取得"""
+        cache_key = query.lower().strip()
+        return self.search_cache.get(cache_key, [])
+    
+    def cache_search_result(self, query: str, result: str) -> None:
+        """検索結果をキャッシュに保存"""
+        cache_key = query.lower().strip()
+        if cache_key not in self.search_cache:
+            self.search_cache[cache_key] = []
+        self.search_cache[cache_key].append({
+            "query": query,
+            "result": result,
+            "source": "cached",
+            "index": len(self.search_cache[cache_key]) - 1,
+            "cached": True
+        })
+    
     def execute_searches(self, queries: List[str]) -> List[Dict[str, Any]]:
-        """複数のクエリで検索を実行"""
+        """複数のクエリで検索を実行（キャッシュ対応）"""
         results = []
+        cache_hits = 0
+        
         for i, query in enumerate(queries):
+            # まずキャッシュを確認
+            cached_results = self.get_cached_results(query)
+            if cached_results:
+                print(f"キャッシュヒット: {query} ({len(cached_results)}件)")
+                cache_hits += 1
+                results.extend(cached_results)
+                continue
+            
+            # キャッシュにない場合のみ新規検索
+            print(f"新規検索: {query}")
             search_result = web_search.invoke(query)
-            results.append({
-                "query": query,
-                "result": search_result,
-                "source": f"search_{i+1}",
-                "index": i
-            })
+            
+            if search_result:
+                # 検索結果をキャッシュに保存
+                self.cache_search_result(query, search_result)
+                
+                results.append({
+                    "query": query,
+                    "result": search_result,
+                    "source": f"search_{i+1}",
+                    "index": i,
+                    "cached": False
+                })
+        
+        # キャッシュ統計をログ出力
+        print(f"キャッシュ統計: {cache_hits}/{len(queries)} ヒット")
+        
         return results
 
 # ===== 信頼性評価エージェント =====
@@ -170,25 +223,125 @@ class ReliabilityAgent:
         else:
             return {"score": 0.6, "reason": "一般ドメイン"}
     
-    def evaluate_content_quality(self, title: str, content: str) -> Dict[str, Any]:
-        """コンテンツの品質をAIで評価"""
-        if len(content) < 100:
-            return {"score": 0.3, "reason": "コンテンツが短すぎる"}
+    def evaluate_content_quality_batch(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """複数のコンテンツを一括で評価"""
+        if not search_results:
+            return []
         
-        prompt = f"""
+        # 評価対象を整形
+        evaluation_data = []
+        for i, result in enumerate(search_results):
+            result_text = result["result"]
+            title_match = re.search(r'タイトル: ([^\n]+)', result_text)
+            title = title_match.group(1) if title_match else ""
+            content_match = re.search(r'内容: ([^\n]+)', result_text)
+            content = content_match.group(1) if content_match else result_text
+            
+            # 短すぎるコンテンツは早期除外
+            if len(content) < 100:
+                evaluation_data.append({
+                    "index": i,
+                    "score": 0.3,
+                    "reason": "コンテンツが短すぎる"
+                })
+                continue
+            
+            evaluation_data.append({
+                "index": i,
+                "title": title,
+                "content": content[:200],  # 最初の200文字のみ使用
+                "needs_evaluation": True
+            })
+        
+        if not evaluation_data:
+            return [{"score": 0.5, "reason": "評価対象なし"}]
+        
+        # バッチ評価プロンプト
+        batch_prompt = f"""
         以下の情報の品質を1-10で評価してください。評価基準：
         - 事実に基づいているか
         - 専門性があるか  
         - 最新情報か
         - 客観的記述か
         
-        タイトル: {title}
-        内容: {content[:500]}...
+        評価対象:
+        {chr(10).join([f"{i+1}. タイトル: {data['title']}\n内容: {data['content']}..." for i, data in enumerate(evaluation_data)])}
         
-        JSON形式で回答:
+        JSON形式で回答（評価結果のリスト）:
         {{
-            "score": 0.8,
-            "reason": "評価理由"
+            "evaluations": [
+                {{"index": 0, "score": 0.8, "reason": "専門的で信頼性高い"}},
+                {{"index": 1, "score": 0.6, "reason": "一般的な情報"}}
+            ]
+        }}
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=batch_prompt)])
+            json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                evaluations = data.get("evaluations", [])
+                
+                # 結果を元の形式に戻す
+                results = []
+                for i, eval_data in enumerate(evaluation_data):
+                    if i < len(evaluations):
+                        score = min(evaluations[i].get("score", 0.5) / 10, 1.0)
+                        reason = evaluations[i].get("reason", "AI評価")
+                    else:
+                        score = eval_data.get("score", 0.5)
+                        reason = eval_data.get("reason", "評価不能")
+                    
+                    results.append({
+                        "index": eval_data["index"],
+                        "score": score,
+                        "reason": reason
+                    })
+                
+                return results
+        except:
+            # エラー時は個別評価
+            return [
+                {"score": 0.5, "reason": "バッチ評価失敗"}
+                for _ in evaluation_data
+            ]
+    
+    def evaluate_content_quality(self, title: str, content: str) -> Dict[str, Any]:
+        """コンテンツの品質を客観的基準で評価"""
+        evaluation_criteria = {
+            "factual_basis": "事実との一致度（1-10）",
+            "source_credibility": "公的情報源か（1-10）",
+            "technical_accuracy": "技術的正確さ（1-10）",
+            "information_depth": "情報の深さと網羅性（1-10）",
+            "objectivity": "客観性（1-10）"
+        }
+        
+        prompt = f"""
+        以下のコンテンツを客観的基準で評価してください。
+        
+        評価対象:
+        タイトル: {title}
+        内容: {content[:200]}
+        
+        評価基準：
+        1. 事実との一致度（1-10）：情報が検証可能な事実とどの程度一致しているか
+        2. 公的情報源か（1-10）：政府機関、学術機関、信頼できるメディアなど
+        3. 技術的正確さ（1-10）：専門用語の適切さ、データの正確さ、技術的な深さ
+        4. 情報の深さと網羅性（1-10）：多角的な視点、情報の網羅性、包括性
+        5. 客観性（1-10）：個人的な偏見の排除、中立的な記述
+        
+        各基準について1-10点で評価し、その根拠を簡潔に記述してください。
+        
+        JSON形式で回答：
+        {{
+            "factual_basis": 0-10のスコア,
+            "source_credibility": 0-10のスコア,
+            "technical_accuracy": 0-10のスコア,
+            "information_depth": 0-10のスコア,
+            "objectivity": 0-10のスコア,
+            "total_score": 0-50のスコア,
+            "evaluation_reason": "各基準の評価根拠"
         }}
         """
         
@@ -197,16 +350,23 @@ class ReliabilityAgent:
             json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
+                total_score = min(data.get("total_score", 25) / 50, 1.0)  # 0-50の範囲に正規化
+                
                 return {
-                    "score": min(data.get("score", 0.5) / 10, 1.0),
-                    "reason": data.get("reason", "AI評価")
+                    "score": total_score,
+                    "reason": f"客観的評価: 総合{total_score*2:.1f}点",
+                    "criteria_scores": {
+                        "factual_basis": data.get("factual_basis", 5),
+                        "source_credibility": data.get("source_credibility", 5),
+                        "technical_accuracy": data.get("technical_accuracy", 5),
+                        "information_depth": data.get("information_depth", 5),
+                        "objectivity": data.get("objectivity", 5)
+                    }
                 }
         except:
-            pass
-        
-        return {"score": 0.5, "reason": "評価不能"}
+            return {"score": 0.5, "reason": "客観的評価失敗"}
     
-    def calculate_overall_reliability(self, search_result: Dict[str, Any]) -> Dict[str, Any]:
+    def calculate_overall_reliability(self, search_result: Dict[str, Any], content_evaluations: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """全体の信頼性スコアを計算"""
         result_text = search_result["result"]
         
@@ -219,7 +379,16 @@ class ReliabilityAgent:
         
         # 各評価を実行
         domain_score = self.evaluate_domain_reliability(url)
-        content_score = self.evaluate_content_quality(title, content)
+        
+        # バッチ評価結果を使用
+        if content_evaluations:
+            result_index = search_result.get("index", 0)
+            if result_index < len(content_evaluations):
+                content_score = content_evaluations[result_index]
+            else:
+                content_score = {"score": 0.5, "reason": "評価対象外"}
+        else:
+            content_score = self.evaluate_content_quality(title, content)
         
         # 新鮮度評価（簡易的）
         freshness_score = {"score": 0.7, "reason": "検索結果"}
@@ -243,11 +412,44 @@ class ReliabilityAgent:
     
     def filter_by_reliability(self, search_results: List[Dict[str, Any]], threshold: float = 0.5) -> Dict[str, Any]:
         """信頼性スコアに基づいて情報をフィルタリング"""
+        # まずバッチ評価を実行
+        content_evaluations = self.evaluate_content_quality_batch(search_results)
+        
         reliability_scores = []
         filtered_results = []
         
-        for result in search_results:
-            score_info = self.calculate_overall_reliability(result)
+        for i, result in enumerate(search_results):
+            # 各評価を実行
+            domain_score = self.evaluate_domain_reliability(
+                self.extract_url_from_result(result["result"])
+            )
+            
+            # バッチ評価結果を使用
+            if i < len(content_evaluations):
+                content_score = content_evaluations[i]
+            else:
+                content_score = {"score": 0.5, "reason": "評価対象外"}
+            
+            # 新鮮度評価（簡易的）
+            freshness_score = {"score": 0.7, "reason": "検索結果"}
+            
+            # 重み付き平均（ドメイン40%、コンテンツ40%、新鮮度20%）
+            overall_score = (
+                domain_score["score"] * 0.4 +
+                content_score["score"] * 0.4 +
+                freshness_score["score"] * 0.2
+            )
+            
+            score_info = {
+                "overall_score": round(overall_score, 2),
+                "domain_score": domain_score,
+                "content_score": content_score,
+                "freshness_score": freshness_score,
+                "url": self.extract_url_from_result(result["result"]),
+                "title": re.search(r'タイトル: ([^\n]+)', result["result"]).group(1) if re.search(r'タイトル: ([^\n]+)', result["result"]) else "",
+                "recommendation": "高品質" if overall_score >= 0.7 else "使用可" if overall_score >= 0.5 else "低品質"
+            }
+            
             reliability_scores.append(score_info)
             
             # 閾値以上の情報のみを保持
