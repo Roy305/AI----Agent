@@ -15,8 +15,11 @@ from urllib.parse import urlparse
 # Streamlit Cloud用: ファイル監視を無効化
 os.environ["STREAMLIT_SERVER_WATCHER_TYPE"] = "none"
 
-# .envファイルから環境変数を読み込み
-load_dotenv()
+# .envファイルから環境変数を読み込み（ローカルのみ）
+try:
+    load_dotenv()
+except:
+    pass  # Cloud環境では無視
 
 # APIキーの設定
 gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -346,6 +349,12 @@ summarizer_agent = SummarizerAgent(llm)
 report_agent = ReportAgent(llm)
 
 # ===== ワークフロー関数 =====
+def should_use_multi_agent_node(state: MultiAgentState) -> MultiAgentState:
+    """マルチエージェントが必要か判断するノード"""
+    decision = should_use_multi_agent(state)
+    state["decision"] = decision
+    return state
+
 def should_use_multi_agent(state: MultiAgentState) -> Literal["multi_agent", "simple"]:
     """マルチエージェントが必要か判断"""
     last_message = state["messages"][-1].content.lower()
@@ -459,7 +468,7 @@ def simple_respond_step(state: MultiAgentState) -> MultiAgentState:
 workflow = StateGraph(MultiAgentState)
 
 # ノードの追加
-workflow.add_node("should_use_multi_agent", lambda state: {"decision": should_use_multi_agent(state)})
+workflow.add_node("should_use_multi_agent", should_use_multi_agent_node)
 workflow.add_node("search", search_step)
 workflow.add_node("reliability", reliability_step)
 workflow.add_node("summarize", summarize_step)
